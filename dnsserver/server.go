@@ -22,15 +22,17 @@ var baseDomain = os.Getenv("BASE_DOMAIN")
 var collabIP = os.Getenv("COLLAB_IP")
 
 type Server struct {
-	mongoClient *mongo.Client
-	rebindCache map[string]bool
-	cacheMutex  sync.RWMutex
+	mongoClient   *mongo.Client
+	rebindCache   map[string]bool
+	cacheMutex    sync.RWMutex
+	staticRecords *map[string][]string
 }
 
-func NewServer(client *mongo.Client) *Server {
+func NewServer(client *mongo.Client, staticRecords *map[string][]string) *Server {
 	return &Server{
-		mongoClient: client,
-		rebindCache: make(map[string]bool),
+		mongoClient:   client,
+		rebindCache:   make(map[string]bool),
+		staticRecords: staticRecords,
 	}
 }
 
@@ -60,9 +62,35 @@ func (s *Server) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 
 		handled := false
 
-		if strings.HasSuffix(lowerQuestionName, "."+baseDomain+".") {
+		// static records
+		if staticRecord, exists := (*s.staticRecords)[lowerQuestionName+":"+dns.TypeToString[question.Qtype]]; exists {
+			for _, value := range staticRecord {
+				if question.Qtype == dns.TypeTXT {
+					msg.Answer = append(msg.Answer, &dns.TXT{
+						Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeTXT, Class: dns.ClassINET, Ttl: 60},
+						Txt: []string{value},
+					})
+				} else if question.Qtype == dns.TypeA {
+					msg.Answer = append(msg.Answer, &dns.A{
+						Hdr: dns.RR_Header{Name: question.Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
+						A:   net.ParseIP(value),
+					})
+				} else if question.Qtype == dns.TypeAAAA {
+					msg.Answer = append(msg.Answer, &dns.AAAA{
+						Hdr:  dns.RR_Header{Name: question.Name, Rrtype: dns.TypeAAAA, Class: dns.ClassINET, Ttl: 60},
+						AAAA: net.ParseIP(value),
+					})
+				} else if question.Qtype == dns.TypeMX {
+					msg.Answer = append(msg.Answer, &dns.MX{
+						Hdr:        dns.RR_Header{Name: question.Name, Rrtype: dns.TypeMX, Class: dns.ClassINET, Ttl: 60},
+						Mx:         value,
+						Preference: 10,
+					})
+				}
+			}
+			handled = true
+		} else if strings.HasSuffix(lowerQuestionName, "."+baseDomain+".") { // handle subdomains
 
-			// get answer
 			lowerQuestionNameLocal := strings.TrimSuffix(lowerQuestionName, "."+baseDomain+".")
 			lastIndex := strings.LastIndex(lowerQuestionNameLocal, ".")
 			host := lowerQuestionNameLocal[lastIndex+1:] + "." + baseDomain

@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"net/http"
@@ -126,7 +127,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		if strings.HasSuffix(url.Host, "."+baseDomain) {
+			http.Error(w, "Recursive request detected", http.StatusBadRequest)
+			return
+		}
+
 		proxy := httputil.NewSingleHostReverseProxy(url)
+		proxy.Transport = &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
 		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 			http.Error(w, fmt.Sprint(err), http.StatusBadGateway)
 		}

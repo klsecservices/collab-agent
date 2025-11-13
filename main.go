@@ -3,10 +3,13 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -20,9 +23,43 @@ import (
 	"collab-agent/smtpserver"
 )
 
-var baseDomain = os.Getenv("BASE_DOMAIN")
+func getEnv(key, defaultValue string) string {
+	if value, ok := os.LookupEnv(key); ok {
+		return value
+	}
+	return defaultValue
+}
 
-const mongo_uri = "mongodb://db:27017/"
+var baseDomain = getEnv("BASE_DOMAIN", "localhost")
+
+var mongo_uri = getEnv("MONGO_URI", "mongodb://db:27017/")
+
+var certFile = getEnv("CERT_FILE", "/root/cert.pem")
+var keyFile = getEnv("KEY_FILE", "/root/privkey.pem")
+
+var staticRecordsFile = getEnv("STATIC_RECORDS_FILE", "/root/static-records.json")
+
+var staticRecords map[string][]string
+
+func parseStaticRecordsFile() {
+	if _, err := os.Stat(staticRecordsFile); os.IsNotExist(err) {
+		fmt.Printf("static records file does not exist: %s\n", staticRecordsFile)
+		return
+	}
+	jsonFile, err := os.Open(staticRecordsFile)
+	if err != nil {
+		fmt.Printf("error opening static records file: %s\n", err)
+		os.Exit(1)
+	}
+
+	defer jsonFile.Close()
+
+	err = json.NewDecoder(jsonFile).Decode(&staticRecords)
+	if err != nil {
+		fmt.Printf("error decoding static records file: %s\n", err)
+		os.Exit(1)
+	}
+}
 
 func getClient() *mongo.Client {
 	opts := options.Client().ApplyURI(mongo_uri)
@@ -49,16 +86,17 @@ func main() {
 	muxHttps := http.NewServeMux()
 	muxHttps.Handle("/", httpServer)
 
+	parseStaticRecordsFile()
 	dnsServerUdp := &dns.Server{
 		Addr:    ":53",
 		Net:     "udp",
-		Handler: dnsserver.NewServer(mongoClient),
+		Handler: dnsserver.NewServer(mongoClient, &staticRecords),
 	}
 
 	dnsServerTcp := &dns.Server{
 		Addr:    ":53",
 		Net:     "tcp",
-		Handler: dnsserver.NewServer(mongoClient),
+		Handler: dnsserver.NewServer(mongoClient, &staticRecords),
 	}
 
 	smtpServer := smtpserver.NewServer(mongoClient)
@@ -68,7 +106,7 @@ func main() {
 	smtpsServer := smtpserver.NewServer(mongoClient)
 	smtpsServer.Addr = ":587"
 	smtpsServer.Domain = baseDomain
-	cert, err := tls.LoadX509KeyPair("/root/cert.pem", "/root/privkey.pem")
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 	if err != nil {
 		fmt.Printf("error loading TLS certificate: %s\n", err)
 		os.Exit(1)
@@ -128,12 +166,27 @@ func main() {
 	}()
 
 	go func() {
-		err := http.ListenAndServeTLS(":443", "/root/cert.pem", "/root/privkey.pem", muxHttps)
+		err := http.ListenAndServeTLS(":443", certFile, keyFile, muxHttps)
 		if errors.Is(err, http.ErrServerClosed) {
 			fmt.Printf("HTTPS server closed\n")
 		} else if err != nil {
 			fmt.Printf("error starting HTTPS server: %s\n", err)
 			os.Exit(1)
+		}
+	}()
+
+	// Setup signal handling for SIGHUP
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGHUP)
+
+	go func() {
+		for {
+			sig := <-sigChan
+			if sig == syscall.SIGHUP {
+				fmt.Printf("Received SIGHUP, reloading static records...\n")
+				parseStaticRecordsFile()
+				fmt.Printf("Static records reloaded successfully\n")
+			}
 		}
 	}()
 
